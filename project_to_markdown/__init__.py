@@ -147,7 +147,7 @@ def get_project(token, uri):
 
     # Perform the query
     project_id_response = graphql_query(query, headers)
-    print(f"project_id_response: {project_id_response}")
+    # print(f"project_id_response: {project_id_response}")
     node_id = project_id_response['data']['organization']['projectV2']['id']
 
 
@@ -227,7 +227,7 @@ def get_project(token, uri):
 
 
     # For now, this will just print the raw response
-    print(project_id_response)
+    # print(project_id_response)
     return project_id_response
 
 
