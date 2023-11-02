@@ -3,7 +3,7 @@ import re
 from argparse import ArgumentParser, FileType
 from collections import defaultdict
 from urllib.parse import urlparse, urlunparse
-
+import requests
 from github import Github, Project
 
 
@@ -78,100 +78,157 @@ def format_cards(cards):
     return list(filter(None, [format_card(card) for card in cards]))
 
 
-def project_to_markdown(project : Project) -> str:
-    # For every column in the project we want to print out:
-    # * Milestones in order of appearance and the cards within in the order of appearance.
-    # * Non-milestone cards in order of appearance
+def convert_to_markdown(json_data):
+    # Dictionary to hold the categorized items
+    categorized_items = {}
 
-    lines = []
+    # Iterate over the items and categorize them by status
+    for item in json_data["data"]["node"]["items"]["nodes"]:
+        # Each item's status and title are within fieldValues
+        status = None
+        title = None
+        for field in item["fieldValues"]["nodes"]:
+            if field.get("field", {}).get("name") == "Status":
+                status = field.get("name")
+            elif field.get("field", {}).get("name") == "Title":
+                title = field.get("text")
+        
+        # If status is found, add the item to the category
+        if status and title:
+            if status not in categorized_items:
+                categorized_items[status] = []
+            categorized_items[status].append(title)
 
-    body = project.body
+    # Now convert the categorized items to markdown format
+    markdown_output = "# Project Board Status\n\n"
+    for status, titles in categorized_items.items():
+        markdown_output += f"## {status}\n"
+        for title in titles:
+            markdown_output += f"- [ ] {title}\n"  # Using task list format
+        markdown_output += "\n"  # Add a newline for formatting
 
-    # We've wrapped stuff in CDATA to prevent it from messing up the github pages.
-    # If there's anything that's CDATA let's pull it outta there.
-    body = re.sub(r'<!\[CDATA\[(.*?)\]\]>', '\g<1>', body, flags=re.MULTILINE | re.DOTALL)
-
-    lines.extend(body.strip().split("\n"))
-
-    lines.append("")
-    lines.append("---")
-
-    for column in project.get_columns():
-        lines.append(f"# {column.name}")
-
-        cards_by_milestone = defaultdict(lambda: [])
-
-        milestones = []
-
-        # We first want to index every card by milestone
-        # while retaining the order.
-        for card in column.get_cards():
-            content = get_card_content(card)
-
-            milestone_id = None
-
-            if content:
-                milestone = content.milestone
-
-                if milestone:
-                    if milestone not in milestones:
-                        milestones.append(milestone)
-                    milestone_id = milestone.id
-
-            cards_by_milestone[milestone_id].append(card)
-
-        # Place non-milestone related cards first.
-        if None in cards_by_milestone:
-            lines.append("")
-            lines.extend(format_cards(cards_by_milestone.pop(None)))
-            lines.append("")
-
-        # Now for each of the milestones we want to pull related cards.
-        for milestone in milestones:
-            milestone_cards = cards_by_milestone.get(milestone.id)
-
-            milestone_url = get_milestone_html_url(milestone)
-
-            lines.append(f"## [{milestone.title}]({milestone_url})")
-
-            if milestone.due_on:
-                eta = milestone.due_on.date().isoformat()
-
-                lines.append(f"**ETA {eta}**")
-                lines.append("")
-
-            if milestone.description:
-                lines.extend(milestone.description.split("\n"))
-
-            lines.append("")
-            lines.extend(format_cards(milestone_cards))
-            lines.append("")
-
-    lines.append("---")
-    lines.append(f"For more information see [the Project that this Roadmap was generated from.]({project.html_url})")
-
-    return '\n'.join(lines)
+    return markdown_output
 
 
-def get_project(github : Github, uri : str) -> Project:
-    project_selector = {}
+def graphql_query(query, headers):
+    """
+    Helper function to perform a GraphQL query using the requests library.
+    """
+    request = requests.post('https://api.github.com/graphql', json={'query': query}, headers=headers)
+    if request.status_code == 200:
+        return request.json()
+    else:
+        raise Exception("Query failed to run by returning code of {}. {}".format(request.status_code, query))
+
+def get_project(token, uri):
+    headers = {"Authorization": f"bearer {token}"}
+    
+    # Extract the org, repo, and project number from the URI
     project_path = urlparse(uri).path
+    matches = re.match(r'^/orgs/([^/]+)/projects/(\d+)$', project_path) or re.match(r'^/([^/]+/[^/]+)/projects/(\d+)$', project_path)
+    if not matches:
+        raise ValueError(f"Invalid project URI: {uri}")
 
-    if matches := re.match(r'^/orgs/([^/]+)/projects/(\d+)$', project_path):
-        # https://github.com/orgs/common-room/projects/1
-        projects = github.get_organization(matches.group(1)).get_projects()
-        project_selector['number'] = int(matches.group(2))
-    elif matches := re.match(r'^/([^/]+/[^/]+)/projects/(\d+)$', project_path):
-        # https://github.com/common-room/architecture-docs/projects/1
-        projects = github.get_repo(matches.group(1)).get_projects()
-        project_selector['number'] = int(matches.group(2))
+    variables = {
+        "login": matches.group(1),
+        "projectNumber": int(matches.group(2))
+    }
+    print(f"variables: {variables}")
+    # Construct the GraphQL query here
+    query = """
+    query{
+        organization(login: "%s"){
+            projectV2(number: %i) {
+                id
+            }
+        }
+    }
+    """ % (variables["login"], variables["projectNumber"])
 
-    # First search for the project by number..
-    for project in projects:
-        if all([getattr(project, key, None) == value  for key, value in project_selector.items()]):
-            return project
+    # Perform the query
+    project_id_response = graphql_query(query, headers)
+    print(f"project_id_response: {project_id_response}")
+    node_id = project_id_response['data']['organization']['projectV2']['id']
 
-    raise ValueError(f"Project not found")
+
+    # Your personal access token
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    # The GraphQL query. Be sure to replace PROJECT_ID with your actual Project ID
+    query = """
+    query {
+    node(id: "%s") {
+        ... on ProjectV2 {
+        items(first: 20) {
+            nodes {
+            id
+            fieldValues(first: 8) {
+                nodes {
+                ... on ProjectV2ItemFieldTextValue {
+                    text
+                    field {
+                    ... on ProjectV2FieldCommon {
+                        name
+                    }
+                    }
+                }
+                ... on ProjectV2ItemFieldDateValue {
+                    date
+                    field {
+                    ... on ProjectV2FieldCommon {
+                        name
+                    }
+                    }
+                }
+                ... on ProjectV2ItemFieldSingleSelectValue {
+                    name
+                    field {
+                    ... on ProjectV2FieldCommon {
+                        name
+                    }
+                    }
+                }
+                }
+            }
+            content {
+                ... on DraftIssue {
+                title
+                body
+                }
+                ... on Issue {
+                title
+                assignees(first: 10) {
+                    nodes {
+                    login
+                    }
+                }
+                }
+                ... on PullRequest {
+                title
+                assignees(first: 10) {
+                    nodes {
+                    login
+                    }
+                }
+                }
+            }
+            }
+        }
+        }
+    }
+    }
+    """ % node_id
+
+    # Perform the query
+    project_id_response = graphql_query(query, headers)
+
+
+    # For now, this will just print the raw response
+    print(project_id_response)
+    return project_id_response
 
 
 def cli():
@@ -187,11 +244,10 @@ def cli():
     output_file = args.output_file
     project_uri = args.project_uri
 
-    github = Github(token)
 
-    project = get_project(github, project_uri)
+    project = get_project(token, project_uri)
 
-    markdown = project_to_markdown(project)
+    markdown = convert_to_markdown(project)
 
     if output_file:
         output_file.write(markdown)
