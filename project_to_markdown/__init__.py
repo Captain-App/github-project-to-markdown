@@ -120,9 +120,7 @@ def graphql_query(query, headers):
     else:
         raise Exception("Query failed to run by returning code of {}. {}".format(request.status_code, query))
 
-def get_project(token, uri):
-    headers = {"Authorization": f"bearer {token}"}
-    
+def get_login_and_project_number_from_uri(uri):
     # Extract the org, repo, and project number from the URI
     project_path = urlparse(uri).path
     matches = re.match(r'^/orgs/([^/]+)/projects/(\d+)$', project_path) or re.match(r'^/([^/]+/[^/]+)/projects/(\d+)$', project_path)
@@ -133,8 +131,11 @@ def get_project(token, uri):
         "login": matches.group(1),
         "projectNumber": int(matches.group(2))
     }
-    print(f"variables: {variables}")
-    # Construct the GraphQL query here
+    return variables["login"], variables["projectNumber"]
+
+def get_project_node_id_from_uri(token, uri):
+    headers = {"Authorization": f"bearer {token}"}
+
     query = """
     query{
         organization(login: "%s"){
@@ -143,14 +144,17 @@ def get_project(token, uri):
             }
         }
     }
-    """ % (variables["login"], variables["projectNumber"])
+    """ % get_login_and_project_number_from_uri(uri)
 
     # Perform the query
     project_id_response = graphql_query(query, headers)
     # print(f"project_id_response: {project_id_response}")
     node_id = project_id_response['data']['organization']['projectV2']['id']
+    print(f"project node_id: {node_id}")
+    return node_id
 
-
+def get_project_contents(token, uri):
+    node_id = get_project_node_id_from_uri(token, uri)
     # Your personal access token
     headers = {
         "Authorization": f"Bearer {token}",
@@ -231,21 +235,138 @@ def get_project(token, uri):
     return project_id_response
 
 
+def get_issues_from_repo(token, org, repo):
+    headers = {"Authorization": f"token {token}"}
+    url = f"https://api.github.com/repos/{org}/{repo}/issues"
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception("Failed to retrieve issues: {}".format(response.status_code))
+
+
+def add_issues_to_project(token, project_uri, issues):
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    project = get_project_contents(token, project_uri)
+    project_node_id = get_project_node_id_from_uri(token, project_uri)
+
+    for issue in issues:
+        # Construct the mutation query to add an issue to the project
+        add_item_mutation = """
+        mutation($projectId: ID!, $contentId: ID!) {
+            addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                item {
+                    id
+                }
+            }
+        }
+        """
+        variables = {
+            "projectId": project_node_id,
+            "contentId": issue['node_id']
+        }
+
+        # Perform the GraphQL mutation
+        add_response = requests.post('https://api.github.com/graphql',
+                                     json={'query': add_item_mutation, 'variables': variables},
+                                     headers=headers)
+        if add_response.status_code != 200:
+            raise Exception(f"Failed to add issue {issue['title']} to project: {add_response.status_code}")
+
+        # Update the status of the issue to 'Extracted'
+        update_status_mutation = """
+        mutation($itemId: ID!, $fieldId: ID!, $value: String!) {
+            updateProjectV2ItemField(input: {itemId: $itemId, fieldId: $fieldId, value: $value}) {
+                item {
+                    id
+                }
+            }
+        }
+        """
+        # You need to replace 'FIELD_ID' with the actual ID of the 'Status' field in your project
+        status_field_id = "Status"
+        status_value = "Extracted"
+        item_id = add_response.json()['data']['addProjectV2ItemById']['item']['id']
+
+        variables = {
+            "itemId": item_id,
+            "fieldId": status_field_id,
+            "value": status_value
+        }
+
+        update_response = requests.post('https://api.github.com/graphql',
+                                        json={'query': update_status_mutation, 'variables': variables},
+                                        headers=headers)
+        if update_response.status_code != 200:
+            raise Exception(f"Failed to set status of issue {issue['title']} to 'Extracted': {update_response.status_code}")
+
+
+
+
+def get_field_id(token, project_uri):
+    headers = {"Authorization": f"Bearer {token}"}
+
+    project_node_id = get_project_node_id_from_uri(token, project_uri)
+
+    # GraphQL query to fetch project fields
+    query = """
+    query($projectId: ID!) {
+        node(id: $projectId) {
+            ... on ProjectV2 {
+                fields(first: 10) {
+                    nodes {
+                        id
+                        name
+                        # Add here any general fields that are common to all field types
+                    }
+                }
+            }
+        }
+    }
+    """
+
+
+    variables = {"projectId": project_node_id}
+
+    response = requests.post('https://api.github.com/graphql',
+                             json={'query': query, 'variables': variables},
+                             headers=headers)
+
+    if response.status_code == 200:
+        print(response.json())
+        # fields = response.json()['data']['node']['fields']['nodes']
+        # for field in fields:
+        #     print(f"Field Name: {field['name']}, Field ID: {field['id']}")
+    else:
+        raise Exception(f"Failed to fetch project fields: {response.status_code}")
+
+
+
 def cli():
     parser = ArgumentParser()
 
     parser.add_argument('--github-token', type=str, default=os.environ.get('GITHUB_TOKEN'))
     parser.add_argument('--output-file', type=FileType('w'))
     parser.add_argument('project_uri')
+    parser.add_argument('--org', type=str, help='GitHub organization name')
+    parser.add_argument('--repo', type=str, help='GitHub repository name')
+    parser.add_argument('--get-field-id', action='store_true', help='Get field IDs for a project')
 
     args = parser.parse_args()
 
     token = args.github_token
     output_file = args.output_file
     project_uri = args.project_uri
+    if args.org and args.repo:
+        issues = get_issues_from_repo(token, args.org, args.repo)
+        print(f"issues: {issues}")
+        add_issues_to_project(token, project_uri, issues)
 
+    if args.get_field_id:
+        get_field_id(args.github_token, args.project_uri)
 
-    project = get_project(token, project_uri)
+    project = get_project_contents(token, project_uri)
 
     markdown = convert_to_markdown(project)
 
