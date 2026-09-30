@@ -1,0 +1,15 @@
+# Backstage catalog entry — discovered by https://backstage.captainapp.co.uk
+# (captain-k3s GitHub App). Edit freely: type, lifecycle, system, owner, links.
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: github-project-to-markdown
+  annotations:
+    github.com/project-slug: Captain-App/github-project-to-markdown
+  tags:
+    - fork
+    - python
+spec:
+  type: service
+  lifecycle: deprecated
+  owner: group:default/captain-app
